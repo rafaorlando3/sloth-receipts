@@ -1,77 +1,101 @@
 # 🦥 sloth-receipts
 
-**Check the day's Pix payment screenshots against your orders while you sleep, on your own laptop.**
+**Advisory triage of Pix receipt screenshots against open orders, using extracted fields.**
 
-Small shops in Brazil that sell over WhatsApp get paid by Pix, and the proof usually arrives as a screenshot in the chat. Someone has to open each one, find the order, compare the amount, look at who was paid, and notice the screenshot that was already used yesterday. sloth-receipts does that overnight and leaves a short list in the morning of only what needs a human.
+Gemma 4 through Ollama can read images; Python rules produce a review report. A screenshot, an OCR field or a `PAID` label is **not bank settlement confirmation**. Use a bank statement or an authenticated PSP event for that.
 
-![demo](docs/demo.gif)
+This version corrects unsafe acceptance in public commit `b43f4773e2bc86438f3b6706e27e342b98ec2891`. It has not been deployed or tested with real payments. No model was run for this correction.
 
-## How it works
+## Rules for an advisory PAID match
 
-1. Put the screenshots in a folder and export your open orders as a CSV.
-2. Gemma 4 (`gemma4:e2b`, open weights, through Ollama) reads each image and returns the fields as JSON: status, amount, date, payer, payee, Pix key, transaction id.
-3. Plain Python rules decide. The model never decides what is paid.
-4. In the morning you get `out/report.html` and `out/report.csv`.
+All gates must pass together:
 
-A receipt is marked **PAID** only when the payment is completed, went to your Pix key, has a new transaction id, matches an open order's amount, is not older than the order, and was paid by the customer. Everything else goes to "needs you":
+1. `is_pix_receipt` is the real JSON boolean `true`; strings and numbers are unreadable.
+2. The amount and date can be parsed by the existing parsers.
+3. Status is exactly the explicitly supported literal `Concluído`. Empty, negated, unknown, padded or other status text requires review.
+4. The transaction ID matches the supported E2E syntax: uppercase `E`, eight digits, a valid `YYYYMMDDHHMM` timestamp, and eleven ASCII alphanumeric characters. It is not repaired, case-folded or stripped before acceptance. A well-formed ID is not proof that OCR read it correctly or that it exists at a bank.
+5. The extracted Pix key is byte-for-byte equal to the nonempty configured key. Payee-name similarity never substitutes for the key.
+6. The ID is not an exact or approximate duplicate in this batch. Approximation can only block a match; it cannot approve one.
+7. There is exactly one open order with the same amount and exact payer name after documented case, accent and whitespace normalization. Punctuation is preserved. An approximate name never approves `PAID`.
+8. The existing date gate passes (default one-day tolerance before the order date).
+
+Only a `PAID` rule match removes its order from this in-memory batch. A different payer or ambiguous order keeps the orders open. No payment, bank update or order-system write is performed.
+
+The status and E2E policy is intentionally narrow. Legitimate receipts outside this supported format may require review. These checks do not detect forged screenshots, establish settlement, or establish that OCR output matches the image.
 
 | Verdict | Meaning |
 |---|---|
-| `AMOUNT_MISMATCH` | Paid a different amount than the order (shows how much short or over) |
-| `DUPLICATE` | Same transaction id as an earlier receipt (a reused screenshot) |
-| `WRONG_PAYEE` | Money went to someone else's Pix key |
-| `STALE_DATE` | Receipt is older than the order |
-| `NOT_COMPLETED` | Scheduled (*agendado*) or pending, not a finished payment |
-| `NO_ORDER` | No open order matches |
-| `PAID_OTHER_PAYER` | Amount matches but another person paid (often family; worth a look) |
-| `NOT_A_RECEIPT` / `UNREADABLE` | Not a Pix receipt, or the key fields could not be read |
+| `PAID` | Advisory screenshot-field match, not payment confirmation |
+| `AMOUNT_MISMATCH` | Exact payer text has an order with another amount |
+| `DUPLICATE` | Exact or approximate ID collision; review rather than approval |
+| `WRONG_PAYEE` | Extracted key differs from configured key, possibly an OCR error |
+| `STALE_DATE` | Receipt date fails the existing order-date tolerance |
+| `NOT_COMPLETED` | Status is not the explicitly supported completed literal |
+| `AMBIGUOUS_ORDER` | No unique exact payer-and-amount link; orders stay open |
+| `PAID_OTHER_PAYER` | Amount matches a single order but payer text differs; order stays open |
+| `NO_ORDER` | No supported open-order match |
+| `NOT_A_RECEIPT` / `UNREADABLE` | False receipt flag, invalid type or missing/malformed required fields |
 
-It is slow on purpose. It reads one image at a time and saves each result as it goes. If the laptop sleeps or the run is stopped, the next run continues where it stopped.
+## Corrected offline reassessment of the 12 saved examples
 
-## Run it
+The original fictional images, `samples/truth.json`, orders and `out/extractions.jsonl` are unchanged. The new rules were applied to the saved extractions, **without new OCR, Ollama, a GPU, network access or bank access**.
+
+| Measure | Result |
+|---|---|
+| Old rules versus original truth verdict labels | 12/12 |
+| Corrected rules versus the same unchanged labels | **7/12** |
+| Advisory PAID rule matches | **1/12** |
+| Receipts needing review | **11/12** |
+| Orders still open after the corrected rules | 10/11 |
+
+This is a small team-authored sample comparison, not independent accuracy, a production guarantee, or a new model benchmark. The five label changes are preserved rather than relabelled to recover 12/12:
+
+| File | Old verdict | Corrected verdict | Reason |
+|---|---|---|---|
+| r02.png | PAID | UNREADABLE | Malformed saved E2E |
+| r03.png | PAID | WRONG_PAYEE | OCR key differs from configured key |
+| r05.png | PAID | UNREADABLE | Malformed saved E2E |
+| r06.png | DUPLICATE | WRONG_PAYEE | Nonmatching OCR key blocks earlier than duplicate classification |
+| r09.png | PAID | UNREADABLE | Malformed saved E2E |
+
+The unchanged saved extractions retain the old evaluator's matches: amount/date/payer/status 12/12 each, Pix key 8/12, transaction ID 8/12. The saved extraction durations average 52.1 seconds (maximum 61.5); they are historical values, not timings from this correction. The original claim of 2 vCPU / 7 GB / no GPU was not independently reproduced here. No 500-image or eight-hour run was performed.
+
+`out/report.csv`, `out/report.html` and `docs/run.log` now describe the offline reassessment. The previous log, report, PNG and GIF are preserved under `historical/public-b43f477/`. The old log says 6 paid / 6 review and labels r10 PAID, which disagrees with its old report/truth. The old GIF was generated from historical artifacts and is **retired from current documentation**, not presented as a corrected run. No replacement GIF or new screenshot capture is claimed.
+
+## Offline regression tests (no OCR)
+
+From the public repository root:
 
 ```bash
-# 1. Ollama + the model (about 4 GB on disk)
-ollama pull gemma4:e2b
+cd sloth-receipts
+SLOTH_SOURCE_ROOT="$PWD" python -I -B tests/test_rules.py
+```
 
-# 2. Fictional sample data (12 receipts, 11 orders, ground truth; needs Pillow)
-python samples/make_samples.py
+The 27 standard-library tests call only the rules, not Ollama or the network. The environment variable points to this repository directory; the test default `/work/candidate` is only for the isolated review package.
 
-# 3. The overnight run (Python 3.9+, standard library only)
+## Running the image reader separately
+
+This correction does not install or run Ollama or a model. If already installed, the existing reader accepts Python 3.9+ and standard-library dependencies:
+
+```bash
 python sloth.py --inbox samples/inbox --orders samples/orders.csv \
   --store-name "Loja Preguiça Feliz" --store-key pix@preguicafeliz.example --out out
-
-# 4. Score what Gemma read and what the rules decided against the ground truth
 python eval.py out
 ```
 
-`orders.csv` needs four columns: `order_id,customer,amount_brl,created` (amount like `149,90`, date `dd/mm/yyyy`).
+`orders.csv` has `order_id,customer,amount_brl,created` (e.g. `149,90`, `20/10/2026`). `eval.py` compares verdict labels, not full order-link correctness, and uses legacy field normalizations. Preserve the sample inputs if comparing results.
 
-## Results on the sample set
+The reader sends image bytes to the configured `--host` (`http://127.0.0.1:11434` by default). Privacy and offline operation require a trusted local endpoint; the program accepts other hosts. Model download, licensing and runtime setup are separate from this correction.
 
-These come from one run of `gemma4:e2b` (Q4_K_M) on a 2 vCPU, 7 GB RAM cloud VM with no GPU.
+## Cache and other limits
 
-| | |
-|---|---|
-| Time per receipt | 52 s on average (max 61.5 s, the rotated and blurred one) |
-| Amount, date, payer name, status read exactly | 12/12 each |
-| Pix key read exactly | 8/12 |
-| Transaction id read exactly (32 characters) | 8/12 |
-| **Final verdicts correct** | **12/12** |
-
-The model reads amounts and names very well, and it slips one or two characters in long ids (`Lp0oK9iJ8uH` became `Lp00K9ij8uH`). For that reason the rules compare Pix keys and ids with a small tolerance, and they never treat a near-miss as proof of payment. The duplicate check still caught the reused screenshot, and the wrong-payee check still caught the payment sent to another person's key.
-
-At about 70 receipts an hour, an 8-hour night covers roughly 500 screenshots on a laptop with no GPU.
-
-## Why local and open
-
-The screenshots show customers' names, amounts and transaction ids. With an open-weight model they never leave the shop's computer, there is no per-image bill, and the check keeps working when the internet is down.
-
-## Limits
-
-- The samples are fictional and every image is labelled as such. Real banks' layouts vary more, so test on your own screenshots (they stay on your machine) before trusting the verdicts.
-- A screenshot is evidence, not settlement. The real confirmation is your bank statement or your PSP's webhook. This tool sorts the pile and points at the suspicious ones.
+- The cache is keyed **only by filename**, not image bytes, model, prompt or rule version. Replacing an image under the same name can reuse stale extraction.
+- Failed extractions are cached too. There is no automatic retry, content-addressed validation, atomic JSONL write or guaranteed crash recovery. A truncated final line can prevent loading. Do not treat this as a safe unattended resume mechanism.
+- Duplicate detection is only within the current `decide` batch. There is no persistent cross-day payment ledger.
+- Amount parsing, date tolerance and screenshot authenticity remain limited; this is not a general financial validation engine.
+- The twelve images are explicitly fictional. No real-customer or bank verification was done.
+- No current GIF, overnight-throughput claim or 12/12 corrected-verdict claim is made.
 
 ## License
 
-MIT
+Code: MIT. Model terms are separate.

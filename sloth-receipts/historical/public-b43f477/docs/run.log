@@ -1,0 +1,25 @@
+[1/12] r01.png 51.5s 
+[2/12] r02.png 50.4s 
+[3/12] r03.png 52.6s 
+[4/12] r04.png 50.6s 
+[5/12] r05.png 51.2s 
+[6/12] r06.png 52.1s 
+[7/12] r07.png 51.0s 
+[8/12] r08.png 51.1s 
+[9/12] r09.png 61.5s 
+[10/12] r10.png 50.4s 
+[11/12] r11.png 51.7s 
+[12/12] r12.png 51.5s 
+Good morning. Gemma read 12 receipts overnight (10 min of slow, steady CPU). 6 paid and matched. 6 need you. 5 orders still unpaid.
+  r01.png: PAID              O-101  
+  r02.png: PAID              O-102  
+  r03.png: PAID              O-103  
+  r04.png: AMOUNT_MISMATCH   O-104  paid R$ 89,90, order is R$ 98,90 (short R$ 9,00)
+  r05.png: PAID              O-105  
+  r06.png: DUPLICATE         -      same transaction as r01.png
+  r07.png: WRONG_PAYEE       -      paid to Marcos Antunes (marcos.antunes@example.com)
+  r08.png: STALE_DATE        O-108  receipt 02/09/2026, order 20/10/2026
+  r09.png: PAID              O-109  
+  r10.png: PAID              O-110  
+  r11.png: NOT_COMPLETED     -      status: Agendado
+  r12.png: NO_ORDER          -      

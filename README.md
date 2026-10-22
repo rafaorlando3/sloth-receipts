@@ -1,21 +1,13 @@
 # 🦥 sloth-receipts
 
-**Check the day's Pix payment screenshots against your orders while you sleep, on your own laptop, with Gemma 4 (open weights, local via Ollama).**
+Advisory Pix screenshot triage with a local image-reader option and explicit Python rules. A `PAID` rule label does not confirm bank settlement.
 
-![demo](sloth-receipts/docs/demo.gif)
+The project is in [`sloth-receipts/`](sloth-receipts/). Read its [rules, corrected results and cache limits](sloth-receipts/README.md).
 
-The project lives in the [`sloth-receipts/`](sloth-receipts/) folder. Full documentation, results and limits: [sloth-receipts/README.md](sloth-receipts/README.md).
+A corrective version applied stricter rules to the same twelve saved fictional extractions without running a model: **7/12 original verdict labels matched, one advisory PAID match, eleven receipts for review**. The old 12/12 claim describes the previous rules and is not the corrected result. Original samples, truth and extractions remain unchanged.
 
-Quick start:
+The previous GIF and PNG are historical, not a corrected run, and are no longer embedded here. The filename-only cache is not a guaranteed safe-resume mechanism.
 
-    cd sloth-receipts
-    ollama pull gemma4:e2b
-    python samples/make_samples.py
-    python sloth.py --inbox samples/inbox --orders samples/orders.csv --store-name "Loja Preguiça Feliz" --store-key pix@preguicafeliz.example --out out
-    python eval.py out
-
-On 12 fictional receipts (2 vCPU, no GPU): 12/12 verdicts correct, 52 s per receipt.
-
-Write-up: [Gemma 4 checks my Pix receipts while I sleep](https://dev.to/rafaorlando3/gemma-4-checks-my-pix-receipts-while-i-sleep-12-of-12-verdicts-right-even-when-it-misreads-44jn)
+Write-up: [the existing DEV article](https://dev.to/rafaorlando3/gemma-4-checks-my-pix-receipts-while-i-sleep-12-of-12-verdicts-right-even-when-it-misreads-44jn).
 
 MIT License.

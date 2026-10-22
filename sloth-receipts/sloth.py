@@ -2,7 +2,7 @@
 """sloth-receipts: check Pix payment screenshots against your orders, overnight, on your own laptop.
 
 Gemma reads each screenshot (locally, through Ollama). Plain Python rules decide.
-Nothing is marked as paid unless amount, payee, status, date and transaction id all agree;
+PAID is an advisory screenshot-rule match, never a bank settlement confirmation;
 everything else lands in a short "needs you" list for the morning.
 
 Usage:
@@ -18,7 +18,7 @@ PROMPT = (
     "Read this Brazilian Pix payment screenshot. Copy each field exactly as printed. "
     "is_pix_receipt = true only if this is a Pix transfer receipt or Pix confirmation screen. "
     "status = the word shown for the transfer status (e.g. Concluído, Agendado, Em processamento); "
-    "if no status is shown but the screen says the Pix was sent, use 'Concluído'. "
+    "if no explicit transfer status is shown, use an empty string; do not infer completion. "
     "amount_brl as printed, like 'R$ 149,90'. date as dd/mm/yyyy. time as HH:MM. "
     "transaction_id = the full 'ID da transação' / end-to-end id, character by character. "
     "If a field is missing use an empty string."
@@ -35,12 +35,13 @@ SCHEMA["properties"]["is_pix_receipt"] = {"type": "boolean"}
 NEEDS_YOU = {
     "AMOUNT_MISMATCH": "Paid a different amount than the order",
     "DUPLICATE": "Same transaction id as an earlier receipt (reused screenshot?)",
-    "WRONG_PAYEE": "Money went to someone else, not to your Pix key",
+    "WRONG_PAYEE": "Extracted Pix key does not exactly match the configured key",
     "STALE_DATE": "Receipt is older than the order",
-    "NOT_COMPLETED": "Scheduled or pending, not a finished payment",
-    "NO_ORDER": "No open order matches this payment",
+    "NOT_COMPLETED": "Status is not an explicitly supported completed status",
+    "NO_ORDER": "No open order matches this receipt",
+    "AMBIGUOUS_ORDER": "No unique exact payer-and-amount link; orders remain open",
     "NOT_A_RECEIPT": "This image is not a Pix receipt",
-    "PAID_OTHER_PAYER": "Amount matches, but someone else paid (check it is the customer's)",
+    "PAID_OTHER_PAYER": "Amount matches, but payer text differs; order remains open",
     "UNREADABLE": "Gemma could not read the key fields",
 }
 
@@ -57,6 +58,8 @@ def sim(a, b):
 
 
 def cents(txt):
+    if not isinstance(txt, str):
+        return None
     m = re.search(r"(\d{1,3}(?:\.\d{3})*|\d+),(\d{2})", txt or "")
     if not m:
         return None
@@ -68,6 +71,8 @@ def brl(c):
 
 
 def parse_date(txt):
+    if not isinstance(txt, str):
+        return None
     try:
         return datetime.strptime((txt or "").strip()[:10], "%d/%m/%Y")
     except ValueError:
@@ -80,7 +85,7 @@ def txid_key(t):
 
 def same_txid(a, b):
     """E2E ids are 32 chars; Gemma sometimes slips one character on blurry images,
-    so two ids that differ by at most 2 edits are treated as the same transaction."""
+    so a normalized similarity ratio >= 0.94 blocks a possible duplicate; it cannot approve payment."""
     a, b = txid_key(a), txid_key(b)
     if len(a) < 20 or len(b) < 20:
         return False
@@ -88,6 +93,31 @@ def same_txid(a, b):
         return True
     return SequenceMatcher(None, a, b).ratio() >= 0.94
 
+
+
+# This is an intentionally narrow accepted screenshot status, not bank verification.
+COMPLETED_STATUSES = frozenset({"Concluído"})
+E2E_PATTERN = re.compile(r"E[0-9]{8}[0-9]{12}[A-Za-z0-9]{11}")
+
+def valid_txid(value):
+    """Accept only the supported E2E shape and a real YYYYMMDDHHMM timestamp.
+    Do not repair OCR, strip whitespace, or authenticate the transaction.
+    """
+    if not isinstance(value, str) or E2E_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        datetime.strptime(value[9:21], "%Y%m%d%H%M")
+    except ValueError:
+        return False
+    return True
+
+def payer_key(value):
+    """Exact name comparison after case/accent/whitespace normalization only."""
+    if not isinstance(value, str):
+        return ""
+    decomposed = unicodedata.normalize("NFKD", value)
+    without_accents = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return " ".join(without_accents.casefold().split())
 
 # ---------- extraction (the only part that uses the model) ----------
 def extract(image_path, model, host):
@@ -119,57 +149,67 @@ def load_cache(path):
 # ---------- rules ----------
 def decide(receipts, orders, store_name, store_key, tolerance_days=1):
     open_orders = {o["order_id"]: o for o in orders}
-    seen = []  # (file, txid)
+    seen = []  # (file, txid); approximate duplicates can only block a match
     results = []
     for rec in receipts:
-        x = rec.get("fields") or {}
+        x = rec.get("fields")
+        x = x if isinstance(x, dict) else {}
         r = dict(file=rec["file"], seconds=rec.get("seconds"), fields=x, order=None, verdict=None, note="")
         amount = cents(x.get("amount_brl"))
         rdate = parse_date(x.get("date"))
-        status = norm(x.get("status"))
+        status = x.get("status")
         if rec.get("error"):
             r.update(verdict="UNREADABLE", note=rec["error"])
-        elif not x.get("is_pix_receipt"):
+        elif type(x.get("is_pix_receipt")) is not bool:
+            r.update(verdict="UNREADABLE", note="is_pix_receipt must be a JSON boolean")
+        elif x["is_pix_receipt"] is False:
             r["verdict"] = "NOT_A_RECEIPT"
         elif amount is None or rdate is None:
             r.update(verdict="UNREADABLE", note="amount or date missing")
-        elif any(w in status for w in ("agend", "pend", "process", "schedul", "cancel", "devolv")):
-            r.update(verdict="NOT_COMPLETED", note=f"status: {x.get('status')}")
-        elif max(sim(x.get("payee_pix_key"), store_key), sim(x.get("payee_name"), store_name)) < 0.8:
-            r.update(verdict="WRONG_PAYEE", note=f"paid to {x.get('payee_name')} ({x.get('payee_pix_key')})")
+        elif not isinstance(status, str) or status not in COMPLETED_STATUSES:
+            r.update(verdict="NOT_COMPLETED", note=f"unsupported or incomplete status: {status}")
+        elif not valid_txid(x.get("transaction_id")):
+            r.update(verdict="UNREADABLE", note="missing or malformed supported E2E transaction id")
+        elif (not isinstance(store_key, str) or not store_key.strip()
+              or not isinstance(x.get("payee_pix_key"), str)
+              or x["payee_pix_key"] != store_key):
+            r.update(verdict="WRONG_PAYEE", note="extracted Pix key does not exactly match configured key")
         else:
-            dup = next((f for f, t in seen if same_txid(t, x.get("transaction_id"))), None)
+            dup = next((f for f, t in seen if same_txid(t, x["transaction_id"])), None)
             if dup:
-                r.update(verdict="DUPLICATE", note=f"same transaction as {dup}")
+                r.update(verdict="DUPLICATE", note=f"same or approximate transaction id as {dup}; review required")
         if r["verdict"] is None:
-            # match: same amount among open orders, best payer-name similarity wins
             cands = [o for o in open_orders.values() if o["cents"] == amount]
-            cands.sort(key=lambda o: sim(o["customer"], x.get("payer_name")), reverse=True)
-            if cands:
-                o = cands[0]
+            payer = payer_key(x.get("payer_name"))
+            exact = [o for o in cands if payer and payer_key(o["customer"]) == payer]
+            if len(exact) > 1 or (not exact and len(cands) > 1):
+                r.update(verdict="AMBIGUOUS_ORDER", note="no unique exact payer-and-amount link; orders preserved")
+            elif cands:
+                o = exact[0] if exact else cands[0]
                 r["order"] = o["order_id"]
                 if rdate < o["created_dt"] - timedelta(days=tolerance_days):
                     r.update(verdict="STALE_DATE", note=f"receipt {x.get('date')}, order {o['created']}")
-                elif sim(o["customer"], x.get("payer_name")) < 0.85:
+                elif not exact:
                     r.update(verdict="PAID_OTHER_PAYER",
-                             note=f"paid by {x.get('payer_name')} for {o['customer']}")
-                    open_orders.pop(o["order_id"])
+                             note="payer text does not exactly match this customer; order preserved")
                 else:
                     r["verdict"] = "PAID"
                     open_orders.pop(o["order_id"])
             else:
-                by_name = sorted(open_orders.values(), key=lambda o: sim(o["customer"], x.get("payer_name")),
-                                 reverse=True)
-                if by_name and sim(by_name[0]["customer"], x.get("payer_name")) >= 0.85:
+                by_name = [o for o in open_orders.values()
+                           if payer and payer_key(o["customer"]) == payer]
+                if len(by_name) > 1:
+                    r.update(verdict="AMBIGUOUS_ORDER", note="multiple orders for exact payer; orders preserved")
+                elif by_name:
                     o = by_name[0]
                     diff = amount - o["cents"]
                     r.update(order=o["order_id"], verdict="AMOUNT_MISMATCH",
-                             note=f"paid {brl(amount)}, order is {brl(o['cents'])} "
+                             note=f"receipt {brl(amount)}, order is {brl(o['cents'])} "
                                   f"({'short' if diff < 0 else 'over'} {brl(abs(diff))})")
                 else:
                     r["verdict"] = "NO_ORDER"
-        if x.get("transaction_id") and r["verdict"] not in ("NOT_A_RECEIPT", "UNREADABLE"):
-            seen.append((rec["file"], x.get("transaction_id")))
+        if valid_txid(x.get("transaction_id")) and r["verdict"] not in ("NOT_A_RECEIPT", "UNREADABLE"):
+            seen.append((rec["file"], x["transaction_id"]))
         results.append(r)
     return results, list(open_orders.values())
 
@@ -186,8 +226,9 @@ def write_report(out, results, unpaid, total_seconds, model):
             w.writerow([r["file"], r["verdict"], r["order"] or "", x.get("amount_brl", ""), x.get("payer_name", ""),
                         x.get("date", ""), x.get("transaction_id", ""), r["note"]])
     mins = total_seconds / 60
-    summary = (f"Good morning. Gemma read {len(results)} receipts overnight ({mins:.0f} min of slow, steady CPU). "
-               f"{len(paid)} paid and matched. {len(needs)} need you. {len(unpaid)} orders still unpaid.")
+    summary = (f"Reviewed {len(results)} extracted receipts. {len(paid)} meet PAID screenshot rules (advisory). "
+               f"{len(needs)} need review. {len(unpaid)} orders remain open. "
+               f"Recorded extraction time: {mins:.1f} min; this is not a new OCR benchmark.")
     rows = []
     for r in needs:
         x = r["fields"]
@@ -209,10 +250,10 @@ td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:t
 <h1>🦥 sloth-receipts: morning report</h1><p class="sum">{html.escape(summary)}</p>
 <h2>Needs you ({len(needs)})</h2><table><tr><th></th><th>Verdict</th><th>Order</th><th>Amount</th><th>Payer</th><th>Detail</th></tr>
 {''.join(rows)}</table>
-<h2>Paid and matched ({len(paid)})</h2><ul>{ok}</ul>
-<h2>Orders still waiting for payment ({len(unpaid)})</h2><ul>{left}</ul>
-<p><small>Model: {html.escape(model)} running locally via Ollama. Screenshots never left this machine.
-Rules, not the model, decide what counts as paid.</small></p>"""
+<h2>PAID screenshot-rule matches, not settlement ({len(paid)})</h2><ul>{ok}</ul>
+<h2>Orders still open in this batch ({len(unpaid)})</h2><ul>{left}</ul>
+<p><small>Extraction model label: {html.escape(model)}. Rules evaluate extracted screenshot fields;
+PAID does not confirm bank settlement. Images are sent to the configured --host; local privacy requires a trusted local host.</small></p>"""
     (out / "report.html").write_text(page, encoding="utf-8")
     return summary
 
@@ -241,7 +282,7 @@ def main():
     images = sorted(p for p in a.inbox.iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"))
     for i, img in enumerate(images, 1):
         if img.name in cache:
-            continue  # resume where last night stopped
+            continue  # filename-only cache; see documented limitations
         try:
             fields, secs = extract(img, a.model, a.host)
             rec = dict(file=img.name, fields=fields, seconds=secs)
